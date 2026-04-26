@@ -1,0 +1,3 @@
+/* Auth Page Toggle Button */
+.toggle- { background: var(--primary); border: none; color: white; font-weight: 700; font-size: 0.85rem; cursor: pointer; padding: 0.5rem 1.25rem; border-radius: 2rem; transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1); margin-left: 0.5rem; }
+.toggle-:hover { background: var(--primary-); transform: translateY(-2px); box-shadow: 0 6px 16px rgba(249, 115, 22, 0.3); }

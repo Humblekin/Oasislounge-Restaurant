@@ -1,0 +1,17 @@
+.toggle-btn {
+  background: var(--primary);
+  border: none;
+  color: white;
+  font-weight: 700;
+  font-size: 0.85rem;
+  cursor: pointer;
+  padding: 0.5rem 1.25rem;
+  border-radius: 2rem;
+  transition: var(--transition);
+  margin-left: 0.5rem;
+}
+.toggle-btn:hover {
+  background: var(--primary- hover);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(249, 115, 22, 0.3);
+}
