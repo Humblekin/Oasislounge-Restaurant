@@ -18,6 +18,8 @@ const handlePayment = async (req: Request) => {
   const url = new URL(req.url);
   const amount = url.searchParams.get('amount');
   const email = url.searchParams.get('email') || 'customer@oasislounge.com';
+  const origin = url.searchParams.get('origin');
+  const dynamicCallbackUrl = origin ? `${origin}/payment-success` : CALLBACK_URL;
   
   if (!PAYSTACK_SECRET) {
     return new Response(JSON.stringify({ error: 'Payment not configured' }), { status: 500, headers: corsHeaders });
@@ -33,7 +35,7 @@ const handlePayment = async (req: Request) => {
       body: JSON.stringify({
         amount: parseInt(amount) * 100,
         email: email,
-        callback_url: CALLBACK_URL,
+        callback_url: dynamicCallbackUrl,
         reference: `OASIS_${Date.now()}`
       })
     });

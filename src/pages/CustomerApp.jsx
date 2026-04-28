@@ -185,7 +185,7 @@ const saveOrderOnlyWithPayment = async () => {
     try {
       // 1. Initialize Paystack transaction via Edge Function
       const { data: payData, error: payError } = await supabase.functions.invoke(
-        `chat?action=payment&amount=${Math.round(cartTotal)}&email=${encodeURIComponent(email)}`, 
+        `chat?action=payment&amount=${Math.round(cartTotal)}&email=${encodeURIComponent(email)}&origin=${encodeURIComponent(window.location.origin)}`, 
         { method: 'POST' }
       );
 
