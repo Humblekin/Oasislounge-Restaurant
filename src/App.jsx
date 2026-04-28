@@ -29,6 +29,10 @@ function PaymentSuccess() {
             .eq('status', 'pending')
             .eq('payment_method', 'Paystack');
         }
+        
+        // Clear the cart so the user doesn't see old items
+        localStorage.removeItem('cart');
+        
         setVerified(true);
       }
     };
