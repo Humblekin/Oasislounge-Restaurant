@@ -52,6 +52,8 @@ const createSupabaseClient = (authHeader = '') => createClient(
   { global: { headers: { Authorization: authHeader } } }
 );
 
+const rateLimitMap = new Map();
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
