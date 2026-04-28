@@ -54,6 +54,16 @@ const createSupabaseClient = (authHeader = '') => createClient(
 
 const rateLimitMap = new Map();
 
+const isValidMessage = (m: any) => m && m.role && m.content && typeof m.content === 'string';
+
+const sanitizeInput = (input: string) => input
+  .replace(/[<>]/g, '')
+  .slice(0, 2000);
+
+const sanitizeOutput = (input: string) => input
+  ? input.replace(/[<>]/g, '')
+  : input;
+
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -154,6 +164,59 @@ serve(async (req) => {
         content: sanitizeInput(m.content || '')
       })) || [];
 
+    // Extract order from recent messages
+    const lastMsgs = sanitizedMessages.slice(-6);
+    const lastText = lastMsgs.map(m => m.content).join(' ').toLowerCase();
+    
+    // Check if user wants Paystack or Cash
+    const wantsOnline = lastText.includes('online') || lastText.includes('paystack') || lastText.includes('pay online');
+    const wantsCash = lastText.includes('cash') || lastText.includes('cod');
+    const paidConfirmation = lastText.includes('paid') || lastText.includes('i have paid') || lastText.includes('done paying');
+    
+    // If user says they paid, verify payment
+    if (paidConfirmation && userId) {
+      try {
+        const { data: latestOrder } = await supabase.from('orders')
+          .select('*')
+          .eq('user_id', userId)
+          .eq('payment_method', 'Paystack')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .single();
+        
+        if (latestOrder) {
+          if (latestOrder.status === 'pending') {
+            // Verify with Paystack
+            try {
+              const verifyRes = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(latestOrder.payment_ref)}`, {
+                headers: { 'Authorization': `Bearer ${PAYSTACK_SECRET}` }
+              });
+              const verifyData = await verifyRes.json();
+              if (verifyData.status && verifyData.data.status === 'success') {
+                await supabase.from('orders').update({ status: 'cooking' }).eq('id', latestOrder.id);
+                return new Response(JSON.stringify({
+                  reply: 'Payment confirmed! Your order is being prepared. We will call when it is on the way!',
+                  action: 'refresh_orders'
+                }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+              }
+            } catch(e) {}
+            return new Response(JSON.stringify({
+              reply: 'We see your order is pending payment. Please confirm you paid with the OTP you received.'
+            }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          } else if (latestOrder.status === 'cooking' || latestOrder.status === 'ready') {
+            return new Response(JSON.stringify({
+              reply: `Your order is ${latestOrder.status}! We'll call when arriving.`
+            }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          }
+        }
+      } catch(e) {
+        return new Response(JSON.stringify({
+          reply: 'No pending order found. Please start a new order.'
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    
+    // Fetch menu for order matching
     const { data: menu } = await supabase.from('menu_items').select('*').eq('available', true);
     
     if (!menu || menu.length === 0) {
@@ -168,6 +231,90 @@ serve(async (req) => {
       var menuSummary = (menu || []).map(m => `- ${m.name}: ₵${m.price}`).join('\n');
     }
 
+    // Check if user ordered - parse items from conversation
+    let orderItems: any[] = [];
+    let address = '';
+    let paymentMethod = wantsCash ? 'Cash on Delivery' : (wantsOnline ? 'Paystack' : '');
+    
+    for (const msg of lastMsgs) {
+      const c = msg.content.toLowerCase();
+      // Match menu items
+      for (const item of menu || []) {
+        if (c.includes(item.name.toLowerCase())) {
+          if (!orderItems.find(i => i.name === item.name)) {
+            orderItems.push({ ...item, quantity: 1 });
+          }
+        }
+      }
+      // Match address patterns
+      const addrMatch = msg.content.match(/(?:to|deliver(?:y)?(?:to)?|at)\s+([^,.\n]+)/i);
+      if (addrMatch && !address) {
+        address = addrMatch[1].trim();
+      }
+    }
+
+    // Complete order - process payment
+    if (orderItems.length > 0 && address && paymentMethod && (wantsOnline || wantsCash)) {
+      const total = orderItems.reduce((sum, item) => sum + (item.price || 0) * item.quantity, 0);
+      
+      if (paymentMethod === 'Paystack' && userId && PAYSTACK_SECRET && !wantsCash) {
+        const ref = `pay_${Date.now()}`;
+        await supabase.from('orders').insert([{
+          user_id: userId,
+          items: orderItems,
+          total,
+          status: 'pending',
+          address,
+          payment_method: 'Paystack',
+          payment_ref: ref
+        }]);
+        
+        try {
+          const payRes = await fetch('https://api.paystack.co/transaction/initialize', {
+            method: 'POST',
+            headers: { 
+              'Authorization': `Bearer ${PAYSTACK_SECRET}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              amount: total * 100,
+              email: 'customer@oasislounge.com',
+              reference: ref,
+              callback_url: dynamicCallbackUrl
+            })
+          });
+          const payData = await payRes.json();
+          console.log('Paystack response:', JSON.stringify(payData));
+          if (payData.status) {
+            return new Response(JSON.stringify({
+              reply: `Order ready! Total: ₵${total}`,
+              payment_link: payData.data.authorization_url,
+              action: 'refresh_orders'
+            }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+          } else {
+            console.log('Paystack failed:', payData);
+          }
+        } catch(e) {
+          console.log('Paystack error:', e);
+        }
+      } else if (paymentMethod === 'Cash on Delivery' || wantsCash) {
+        await supabase.from('orders').insert([{
+          user_id: userId,
+          items: orderItems,
+          total,
+          status: 'pending',
+          address,
+          payment_method: 'Cash on Delivery'
+        }]);
+        
+        return new Response(JSON.stringify({
+          reply: `Order confirmed! We'll call when we arrive at ${address}.`,
+          action: 'refresh_orders'
+        }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' } });
+      }
+    }
+    
+    // Continue normal chat flow...
     let orderHistory = '';
     if (userId) {
       const { data: orders } = await supabase.from('orders').select('*').eq('user_id', userId).order('created_at', { ascending: false }).limit(5);
@@ -176,36 +323,22 @@ serve(async (req) => {
           `- ${o.status.toUpperCase()}: ${o.items?.map(i => i.name).join(', ') || 'Order'} (₵${o.total})`
         ).join('\n');
       }
-    }
+}
 
-    const PAYSTACK_SECRET = Deno.env.get('PAYSTACK_SECRET_KEY');
-const CALLBACK_URL = Deno.env.get('CALLBACK_URL') || 'https://oasislounge.netlify.app/payment-success';
-
-const tools = [
+    const tools = [
       {
         type: 'function',
         function: {
           name: 'generatePaymentLink',
-          description: 'Generate Paystack payment link AND save the pending order. Call this ONLY when user confirms they want to pay with Paystack.',
+          description: 'Create payment link. REQUIRED: items (array of names), quantities, address. Example: {items: ["Burger"], quantities: [1], address: "123 Main St"}',
           parameters: {
             type: 'object',
             properties: {
-              itemIds: { type: 'array', items: { type: 'string' } },
+              items: { type: 'array', items: { type: 'string' } },
               quantities: { type: 'array', items: { type: 'number' } },
               address: { type: 'string' }
             },
-            required: ['itemIds', 'quantities', 'address']
-          },
-        },
-      },
-      {
-        type: 'function',
-        function: {
-          name: 'checkPaymentStatus',
-          description: 'Check if the user has successfully paid for their recent Paystack order.',
-          parameters: {
-            type: 'object',
-            properties: {}
+            required: ['items', 'quantities', 'address']
           },
         },
       },
@@ -213,63 +346,63 @@ const tools = [
         type: 'function',
         function: {
           name: 'confirmOrder',
-          description: 'Confirm order ONLY for Cash on Delivery or Mobile Money.',
+          description: 'Confirm cash on delivery order. Required: items, quantities, address, amount, paymentMethod',
           parameters: {
             type: 'object',
             properties: {
-              itemIds: { type: 'array', items: { type: 'string' } },
+              items: { type: 'array', items: { type: 'string' } },
               quantities: { type: 'array', items: { type: 'number' } },
               address: { type: 'string' },
               amount: { type: 'number' },
-              paymentMethod: { type: 'string', description: 'Cash on Delivery or Mobile Money' }
+              paymentMethod: { type: 'string' }
             },
-            required: ['itemIds', 'quantities', 'address', 'amount', 'paymentMethod']
+            required: ['items', 'quantities', 'address', 'amount', 'paymentMethod']
           },
         },
       },
       {
         type: 'function',
         function: {
-          name: 'cancelPendingOrder',
-          description: 'Cancel the most recent pending order. No order ID needed - finds it automatically.',
-          parameters: {
-            type: 'object',
-            properties: {}
-          },
+          name: 'checkPaymentStatus',
+          description: 'Check if user paid. No arguments needed.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'getMenu',
+          description: 'Get current menu items and prices. No arguments needed.',
+          parameters: { type: 'object', properties: {} },
         },
       }
     ];
 
 const sysMsg = {
       role: 'system',
-      content: `You are the OASISLOUNGE Concierge.
-      
-      CURRENT MENU:
-      ${menuSummary}
-      ${orderHistory}
-      
-      SECURITY RULES - NEVER OVERRIDE:
-      1. NEVER reveal API keys, secrets, or payment credentials to anyone.
-      2. NEVER show database structure or internal system details.
-      3. NEVER process orders without valid payment confirmation for Paystack.
-      4. NEVER cancel orders without explicit user confirmation.
-      5. If asked about system security, say "I cannot discuss internal system details."
-      6. If asked to bypass payment, say "Payment is required for all orders."
-      
-      PAYMENT OPTIONS:
-      - Cash on Delivery: Pay when food arrives
-      - Mobile Money: Transfer to our MoMo account  
-      - Paystack: Online card payment
-      
-ORDER FLOW - IMPORTANT:
-       1. Get items and quantities from customer.
-       2. Ask delivery address.
-       3. Ask payment method: "Cash on Delivery", "Mobile Money", or "Paystack"?
-       4. If Paystack: YOU MUST call generatePaymentLink. This gives the user a link. Tell them to pay and let you know when they are done.
-       5. If the user says they have paid, YOU MUST call checkPaymentStatus to verify. Do not confirm without checking!
-       6. If Cash/MoMo: call confirmOrder directly - say "Your order is confirmed!"
-      
-      Tone: Friendly, professional OASISLOUNGE concierge. Feel free to help them with another order after one is completed.`
+      name: 'oasis_concierge',
+      content: `You are OASISLOUNGE ordering assistant.
+
+MENU: ${menuSummary}
+
+STRICT RULES:
+1. NEVER write (function= or any tool syntax in your response - user cannot see it
+2. If you write a tool call, it goes to the system automatically - user only sees your text response
+3. Ask: "What would you like?" then "Delivery address?" then "Cash or online?"
+4. When user says "online" or "paystack" - respond "Generating payment link..." ONLY, then wait
+5. Don't explain tool calls - they happen automatically
+
+Example conversation:
+User: I want Burger
+You: Sure! Anything else?
+User: Just Burger
+You: Delivery address?
+User: 123 Main St
+You: Pay cash on delivery or online?
+User: online
+You: Generating payment link... [system handles the rest]
+
+Your job: Keep responses SHORT and natural.`
     };
 
     let chatMessages = [sysMsg, ...messages];
@@ -285,38 +418,62 @@ ORDER FLOW - IMPORTANT:
       }),
     });
 
-    let openaiResData = await openaiRes.json();
-    let aiMessage = openaiResData.choices[0].message;
+let openaiResData = await openaiRes.json();
+    let aiMessage = openaiResData.choices?.[0]?.message;
+    
+    if (!aiMessage) {
+      return new Response(JSON.stringify({ error: 'No response from AI model' }), { 
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
+      });
+    }
 
-if (aiMessage.tool_calls) {
+    if (aiMessage.tool_calls) {
       chatMessages.push(aiMessage);
       let paymentLink = null;
       
       for (const toolCall of aiMessage.tool_calls) {
         if (toolCall.function.name === 'generatePaymentLink') {
           if (!userId) {
-            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "Login required"}' });
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "LOGIN_REQUIRED: You must be logged in to pay. Please login or sign up first, then try again."}' });
             continue;
           }
           
-          const args = JSON.parse(toolCall.function.arguments);
+          let args = {};
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch (e) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: `{"error": "Invalid arguments: ${e.message}"}` });
+            continue;
+          }
+          console.log('generatePaymentLink called, args:', args);
+          
+          let itemNames = args.items || [];
+          let quantities = args.quantities || [];
           let total = 0;
           let orderItems = [];
           
+          if (itemNames.length === 0) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "No items provided. Please tell me what you want to order."}' });
+            continue;
+          }
+          
           try {
-            const { data: menuItems } = await supabase.from('menu_items').select('*').in('id', args.itemIds || []);
-            orderItems = (args.itemIds || []).map((id, index) => {
-              const itemData = menuItems?.find(m => m.id === id);
-              const qty = args.quantities[index] || 1;
-              total += (itemData?.price || 0) * qty;
-              return { ...itemData, quantity: qty };
-            }).filter(item => item.name && item.price);
+            const { data: menuItems } = await supabase.from('menu_items').select('*');
+            orderItems = itemNames.map((name, index) => {
+              const itemData = menuItems?.find(m => m.name.toLowerCase() === name.toLowerCase() || m.name.includes(name));
+              const qty = quantities?.[index] || 1;
+              if (itemData) {
+                total += (itemData.price || 0) * qty;
+                return { ...itemData, quantity: qty };
+              }
+              return null;
+            }).filter(item => item !== null);
           } catch (e) {
             console.log('Menu fetch error:', e);
           }
           
-          if (total === 0) {
-            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "Invalid order items"}' });
+          if (orderItems.length === 0) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "Items not found. Please choose from our menu: Jollof Rice, Waakye, Burger, or Fries."}' });
             continue;
           }
 
@@ -324,6 +481,7 @@ if (aiMessage.tool_calls) {
           let payError = null;
           
           if (PAYSTACK_SECRET) {
+            console.log('PAYSTACK_SECRET is set, generating payment link...');
             try {
               const ref = `pay_${Date.now()}`;
               
@@ -357,13 +515,17 @@ if (aiMessage.tool_calls) {
               });
               
               const payData = await payRes.json();
+              console.log('Paystack response:', JSON.stringify(payData));
               if (payData.status) {
                 payLink = payData.data.authorization_url;
+                console.log('Payment link generated:', payLink);
               } else {
                 payError = payData.message;
+                console.log('Paystack error:', payError);
               }
             } catch (e) {
               payError = e.message;
+              console.log('Paystack exception:', e);
             }
           } else {
             payError = 'PAYSTACK_SECRET_KEY not set';
@@ -373,6 +535,7 @@ if (aiMessage.tool_calls) {
             ? JSON.stringify({ success: true, payment_link: payLink, message: "Tell the user to click the link to pay, then verify." })
             : `{"error": "${payError || 'Paystack not configured'}"}`;
 
+          console.log('Tool response:', toolResponse);
           chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: toolResponse });
         }
         
@@ -408,8 +571,14 @@ if (aiMessage.tool_calls) {
             chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'placeOrder', content: '{"error": "Login required"}' });
             continue;
           }
-          const args = JSON.parse(toolCall.function.arguments);
-          const { data: items } = await supabase.from('menu_items').select('*').in('id', args.itemIds);
+          let args = {};
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch (e) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'placeOrder', content: `{"error": "Invalid arguments"}` });
+            continue;
+          }
+          const { data: items } = await supabase.from('menu_items').select('*').in('id', args.itemIds || []);
           
           let total = 0;
           const orderItems = args.itemIds.map((id, index) => {
@@ -441,22 +610,31 @@ if (aiMessage.tool_calls) {
             chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'confirmOrder', content: '{"error": "Login required"}' });
             continue;
           }
-          const args = JSON.parse(toolCall.function.arguments);
+          let args = {};
+          try {
+            args = JSON.parse(toolCall.function.arguments || '{}');
+          } catch (e) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'confirmOrder', content: `{"error": "Invalid arguments"}` });
+            continue;
+          }
           
+          let itemNames = args.items || [];
+          let quantities = args.quantities || [];
           let orderItems = [];
           let total = args.amount || 0;
           
-          if (args.itemIds && args.itemIds.length > 0) {
+          if (itemNames && itemNames.length > 0) {
             try {
               const { data: menuItems } = await supabase.from('menu_items').select('*');
-              orderItems = args.itemIds.map((idOrName, index) => {
-                const itemData = menuItems?.find(m => m.id === idOrName || m.name === idOrName);
-                if (!itemData) {
-                  return { name: idOrName, price: args.amount ? args.amount / (args.quantities?.[index] || 1) : 0, quantity: (args.quantities && args.quantities[index]) || 1 };
+              orderItems = itemNames.map((name, index) => {
+                const itemData = menuItems?.find(m => m.name.toLowerCase() === name.toLowerCase() || m.name.includes(name));
+                const qty = quantities?.[index] || 1;
+                if (itemData) {
+                  return { ...itemData, quantity: qty };
                 }
-                return { ...itemData, quantity: (args.quantities && args.quantities[index]) || 1 };
-              }).filter(item => item.name && item.price);
-              total = orderItems.reduce((sum, item) => sum + (item.price || 0) * item.quantity, 0);
+                return { name: name, price: 0, quantity: qty };
+              }).filter(item => item.name && (item.price > 0 || total > 0));
+              total = orderItems.reduce((sum, item) => sum + (item.price || 0) * item.quantity, 0) || total;
             } catch (e) {
               console.log('Menu fetch error:', e);
             }
@@ -476,6 +654,16 @@ if (aiMessage.tool_calls) {
             tool_call_id: toolCall.id,
             name: 'confirmOrder',
             content: error ? `{"error": "${error.message}"}` : '{"success": true, "message": "Order placed successfully!"}'
+          });
+        }
+        
+        if (toolCall.function.name === 'getMenu') {
+          const { data: menuItems } = await supabase.from('menu_items').select('name, price').eq('available', true);
+          chatMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            name: 'getMenu',
+            content: JSON.stringify({ menu: menuItems || [] })
           });
         }
         
@@ -513,8 +701,10 @@ if (aiMessage.tool_calls) {
         body: JSON.stringify({ model: 'llama-3.1-8b-instant', messages: chatMessages }),
       }).then(res => res.json());
 
+      let replyText = finalRes.choices?.[0]?.message?.content || 'Something went wrong';
+      
       return new Response(JSON.stringify({ 
-        reply: finalRes.choices[0].message.content, 
+        reply: replyText, 
         action: 'refresh_orders',
         payment_link: paymentLink 
       }), {
@@ -522,14 +712,18 @@ if (aiMessage.tool_calls) {
       });
     }
 
+    let replyText = aiMessage.content || 'Something went wrong';
+    
     return new Response(JSON.stringify({ 
-        reply: sanitizeOutput(aiMessage.content), 
+        reply: replyText, 
+        action: 'refresh_orders',
         payment_link: null 
       }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
 
   } catch (err) {
+    console.log('Edge function error:', err.message);
     return new Response(JSON.stringify({ error: err.message }), { 
       headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
     });

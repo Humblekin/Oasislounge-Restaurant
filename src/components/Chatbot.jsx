@@ -107,58 +107,45 @@ export default function Chatbot({ session }) {
            </div>
 
 <div className="chat-messages hide-scrollbar">
-               {messages.map((msg, idx) => (
-                 <div key={idx} className={`bubble-row ${msg.role}`}>
-                     <div className="bubble">
-                       {msg.paymentLink || msg.content?.includes('checkout.paystack') ? (
-                         <div className="payment-link-container">
-                           {msg.content.includes('checkout.paystack') ? (
-                             <>
-                               <p>Your payment link is ready!</p>
-                               <a 
-                                 href={msg.paymentLink || msg.content.match(/https:\/\/[^\s]+paystack[^\s]*/)?.[0]}
-                                 target="_blank"
-                                 rel="noopener noreferrer"
-                                 className="pay-btn"
-                               >
-                                 💳 Pay Now
-                               </a>
-                               <button 
-                                 onClick={() => setInput("Cash on Delivery")}
-                                 className="cod-btn"
-                               >
-                                 Or Pay on Delivery
-                               </button>
-                             </>
-                           ) : (
-                             <>
-                               <p>{msg.content}</p>
-                               <a 
-                                 href={msg.paymentLink}
-                                 target="_blank"
-                                 rel="noopener noreferrer"
-                                 className="pay-btn"
-                               >
-                                 💳 Pay Now
-                               </a>
-                               <button 
-                                 onClick={() => setInput("Cash on Delivery")}
-                                 className="cod-btn"
-                               >
-                                 Or Pay on Delivery
-                               </button>
-                             </>
-                           )}
-                         </div>
-                       ) : (
-                         <div className="bubble-content">
-                           {msg.content}
+                {messages.map((msg, idx) => {
+                  const get_payment_link = () => {
+                    if (msg.paymentLink && (msg.paymentLink.includes('paystack') || msg.paymentLink.startsWith('http'))) {
+                      return msg.paymentLink;
+                    }
+                    return null;
+                  };
+                  const payLink = get_payment_link();
+                  const showPayButton = msg.paymentLink || msg.content?.includes('paystack') || msg.content?.includes('payment_link');
+                  
+                  return (
+<div key={idx} className={`bubble-row ${msg.role}`}>
+                      <div className="bubble">
+                        {showPayButton && payLink ? (
+                          <div className="payment-link-container">
+                            <p>Your payment link is ready!</p>
+                            <button 
+                              onClick={() => window.location.href = payLink}
+                              className="pay-btn"
+                            >
+                              💳 Pay Now
+                            </button>
+                                 <button 
+                                  onClick={() => setInput("Cash on Delivery")}
+                                  className="cod-btn"
+                                >
+                                  Or Pay on Delivery
+                                </button>
+                          </div>
+                        ) : (
+                          <div className="bubble-content">
+                          {msg.content}
                          </div>
                        )}
-                     </div>
-                  </div>
-               ))}
-               {isTyping && (
+</div>
+                   </div>
+                );
+                })}
+                {isTyping && (
                  <div className="bubble-row assistant">
                     <div className="bubble typing">...</div>
                  </div>
