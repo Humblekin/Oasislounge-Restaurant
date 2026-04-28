@@ -151,7 +151,7 @@ export default function AuthPage({ session }) {
                 onClick={() => setIsLogin(!isLogin)}
                 className="toggle-btn"
               >
-                {isLogin ? "Join LocalEats" : "Login Now"}
+                {isLogin ? "Join OASISLOUNGE" : "Login Now"}
               </button>
             </p>
           </div>
