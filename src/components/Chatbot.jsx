@@ -43,7 +43,7 @@ export default function Chatbot({ session }) {
 
     try {
       const { data, error } = await supabase.functions.invoke('chat', {
-        body: { messages: newMessages, userId: session?.user?.id || null }
+        body: { messages: newMessages, userId: session?.user?.id || null, origin: window.location.origin }
       });
       
       if (error) {

@@ -139,7 +139,8 @@ serve(async (req) => {
     const authHeader = req.headers.get('Authorization');
     const supabase = createSupabaseClient(authHeader ?? '');
 
-    const { messages, userId } = await req.json();
+    const { messages, userId, origin } = await req.json();
+    const dynamicCallbackUrl = origin ? `${origin}/payment-success` : CALLBACK_URL;
     
     // Security: Sanitize messages
     const sanitizedMessages = messages
@@ -346,7 +347,7 @@ if (aiMessage.tool_calls) {
                   amount: total * 100,
                   email: 'customer@oasislounge.com',
                   reference: ref,
-                  callback_url: CALLBACK_URL,
+                  callback_url: dynamicCallbackUrl,
                   webhook_url: `${SUPABASE_URL}/functions/v1/chat/webhook`
                 })
               });
