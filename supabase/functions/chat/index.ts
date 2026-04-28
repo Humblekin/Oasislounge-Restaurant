@@ -181,30 +181,44 @@ const tools = [
         type: 'function',
         function: {
           name: 'generatePaymentLink',
-          description: 'Generate Paystack payment link. Call this ONLY when user confirms they want to pay with Paystack.',
+          description: 'Generate Paystack payment link AND save the pending order. Call this ONLY when user confirms they want to pay with Paystack.',
           parameters: {
             type: 'object',
             properties: {
-              amount: { type: 'number', description: 'Total amount in Cedis' }
+              itemIds: { type: 'array', items: { type: 'string' } },
+              quantities: { type: 'array', items: { type: 'number' } },
+              address: { type: 'string' }
             },
-            required: ['amount']
+            required: ['itemIds', 'quantities', 'address']
           },
         },
       },
-{
+      {
+        type: 'function',
+        function: {
+          name: 'checkPaymentStatus',
+          description: 'Check if the user has successfully paid for their recent Paystack order.',
+          parameters: {
+            type: 'object',
+            properties: {}
+          },
+        },
+      },
+      {
         type: 'function',
         function: {
           name: 'confirmOrder',
-          description: 'Confirm order ONLY after Paystack payment is successful.',
+          description: 'Confirm order ONLY for Cash on Delivery or Mobile Money.',
           parameters: {
             type: 'object',
             properties: {
               itemIds: { type: 'array', items: { type: 'string' } },
               quantities: { type: 'array', items: { type: 'number' } },
               address: { type: 'string' },
-              amount: { type: 'number' }
+              amount: { type: 'number' },
+              paymentMethod: { type: 'string', description: 'Cash on Delivery or Mobile Money' }
             },
-            required: ['itemIds', 'quantities', 'address', 'amount']
+            required: ['itemIds', 'quantities', 'address', 'amount', 'paymentMethod']
           },
         },
       },
@@ -245,14 +259,12 @@ const sysMsg = {
 ORDER FLOW - IMPORTANT:
        1. Get items and quantities from customer.
        2. Ask delivery address.
-       3. Ask payment method: "Cash on Delivery", "Mobile Money", or "Paystack (online)"?
-       4. If Paystack: YOU MUST call generatePaymentLink with the amount. Then wait for user to pay. After payment, call confirmOrder.
-       5. If Cash/MoMo: you may call confirmOrder directly - say "Your order is confirmed!"
-       6. After Paystack payment succeeds: call confirmOrder and say "Payment confirmed! Your order is being prepared."
-       
-       PAYSTACK RULE: You MUST call generatePaymentLink first, then wait for user to pay, THEN call confirmOrder. Never call confirmOrder before generatePaymentLink for Paystack!
+       3. Ask payment method: "Cash on Delivery", "Mobile Money", or "Paystack"?
+       4. If Paystack: YOU MUST call generatePaymentLink. This gives the user a link. Tell them to pay and let you know when they are done.
+       5. If the user says they have paid, YOU MUST call checkPaymentStatus to verify. Do not confirm without checking!
+       6. If Cash/MoMo: call confirmOrder directly - say "Your order is confirmed!"
       
-      Tone: Friendly, professional OASISLOUNGE concierge.`
+      Tone: Friendly, professional OASISLOUNGE concierge. Feel free to help them with another order after one is completed.`
     };
 
     let chatMessages = [sysMsg, ...messages];
@@ -277,56 +289,113 @@ if (aiMessage.tool_calls) {
       
       for (const toolCall of aiMessage.tool_calls) {
         if (toolCall.function.name === 'generatePaymentLink') {
-          const args = JSON.parse(toolCall.function.arguments);
-          const amount = args.amount * 100;
+          if (!userId) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "Login required"}' });
+            continue;
+          }
           
+          const args = JSON.parse(toolCall.function.arguments);
+          let total = 0;
+          let orderItems = [];
+          
+          try {
+            const { data: menuItems } = await supabase.from('menu_items').select('*').in('id', args.itemIds || []);
+            orderItems = (args.itemIds || []).map((id, index) => {
+              const itemData = menuItems?.find(m => m.id === id);
+              const qty = args.quantities[index] || 1;
+              total += (itemData?.price || 0) * qty;
+              return { ...itemData, quantity: qty };
+            }).filter(item => item.name && item.price);
+          } catch (e) {
+            console.log('Menu fetch error:', e);
+          }
+          
+          if (total === 0) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: '{"error": "Invalid order items"}' });
+            continue;
+          }
+
           let payLink = null;
           let payError = null;
-          console.log('PAYSTACK_SECRET available:', !!PAYSTACK_SECRET);
+          
           if (PAYSTACK_SECRET) {
             try {
               const ref = `pay_${Date.now()}`;
-            const payRes = await fetch('https://api.paystack.co/transaction/initialize', {
-              method: 'POST',
-              headers: { 
-                'Authorization': `Bearer ${PAYSTACK_SECRET}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                amount: amount,
-                email: 'customer@oasislounge.com',
-                reference: ref,
-                callback_url: CALLBACK_URL,
-                webhook_url: `${SUPABASE_URL}/functions/v1/chat/webhook`
-              })
-            });
+              
+              // Save the order to DB first
+              const { error: insertError } = await supabase.from('orders').insert([{ 
+                user_id: userId, 
+                items: orderItems, 
+                total, 
+                status: 'pending',
+                address: args.address || 'Not provided',
+                payment_method: 'Paystack',
+                payment_ref: ref
+              }]);
+              
+              if (insertError) throw insertError;
+
+              // Generate Paystack Link
+              const payRes = await fetch('https://api.paystack.co/transaction/initialize', {
+                method: 'POST',
+                headers: { 
+                  'Authorization': `Bearer ${PAYSTACK_SECRET}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                  amount: total * 100,
+                  email: 'customer@oasislounge.com',
+                  reference: ref,
+                  callback_url: CALLBACK_URL,
+                  webhook_url: `${SUPABASE_URL}/functions/v1/chat/webhook`
+                })
+              });
+              
               const payData = await payRes.json();
-              console.log('Paystack response:', payData);
               if (payData.status) {
                 payLink = payData.data.authorization_url;
               } else {
-                payError = payData.message || JSON.stringify(payData);
+                payError = payData.message;
               }
             } catch (e) {
               payError = e.message;
             }
           } else {
-            payError = 'PAYSTACK_SECRET_KEY not set in Edge Function secrets';
+            payError = 'PAYSTACK_SECRET_KEY not set';
           }
           
-          paymentLink = payLink;
-          const toolResponse = paymentLink 
-            ? JSON.stringify({ success: true, payment_link: paymentLink })
+          const toolResponse = payLink 
+            ? JSON.stringify({ success: true, payment_link: payLink, message: "Tell the user to click the link to pay, then verify." })
             : `{"error": "${payError || 'Paystack not configured'}"}`;
 
-          console.log('Tool response:', toolResponse);
-
-          chatMessages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            name: 'generatePaymentLink',
-            content: toolResponse
-          });
+          chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'generatePaymentLink', content: toolResponse });
+        }
+        
+        if (toolCall.function.name === 'checkPaymentStatus') {
+          if (!userId) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'checkPaymentStatus', content: '{"error": "Login required"}' });
+            continue;
+          }
+          
+          try {
+            const { data: latestOrder } = await supabase.from('orders')
+              .select('status')
+              .eq('user_id', userId)
+              .eq('payment_method', 'Paystack')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .single();
+              
+            if (!latestOrder) {
+              chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'checkPaymentStatus', content: '{"paid": false, "message": "No recent Paystack order found."}' });
+            } else if (latestOrder.status === 'paid' || latestOrder.status === 'confirmed') {
+              chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'checkPaymentStatus', content: '{"paid": true, "message": "Payment verified."}' });
+            } else {
+              chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'checkPaymentStatus', content: '{"paid": false, "message": "Order is still pending."}' });
+            }
+          } catch(e) {
+            chatMessages.push({ role: 'tool', tool_call_id: toolCall.id, name: 'checkPaymentStatus', content: `{"error": "${e.message}"}` });
+          }
         }
         
         if (toolCall.function.name === 'placeOrder') {
@@ -394,7 +463,7 @@ if (aiMessage.tool_calls) {
             total, 
             status: 'pending',
             address: args.address || 'Not provided',
-            payment_method: 'Cash on Delivery'
+            payment_method: args.paymentMethod || 'Cash on Delivery'
           }]);
 
           chatMessages.push({

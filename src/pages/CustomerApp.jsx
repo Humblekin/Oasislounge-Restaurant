@@ -180,12 +180,26 @@ const saveOrderOnlyWithPayment = async () => {
     if (cart.length === 0) { alert("Tray empty"); return; }
     if (!fullName.trim() || !phone.trim() || !address.trim()) { alert("Fill delivery details"); return; }
     
-    const ref = 'OASIS_' + Date.now();
-    const amount = Math.round(cartTotal) * 100;
     const email = session?.user?.email || 'customer@oasislounge.com';
     
     try {
-      // Save order first
+      // 1. Initialize Paystack transaction via Edge Function
+      const { data: payData, error: payError } = await supabase.functions.invoke(
+        `chat?action=payment&amount=${Math.round(cartTotal)}&email=${encodeURIComponent(email)}`, 
+        { method: 'POST' }
+      );
+
+      if (payError) throw payError;
+      
+      // Check if Paystack initialization was successful
+      if (!payData?.status || !payData?.data?.authorization_url) {
+        alert("Payment initialization failed: " + (payData?.message || "Unknown error"));
+        return;
+      }
+      
+      const ref = payData.data.reference;
+
+      // 2. Save order to database with the payment reference
       const orderData = {
         user_id: session?.user?.id,
         items: cart,
@@ -194,7 +208,8 @@ const saveOrderOnlyWithPayment = async () => {
         full_name: fullName,
         phone: phone,
         address: address,
-        payment_method: 'Paystack'
+        payment_method: 'Paystack',
+        payment_ref: ref // Link this order to the Paystack transaction
       };
       
       const { error } = await supabase.from("orders").insert(orderData);
@@ -203,13 +218,11 @@ const saveOrderOnlyWithPayment = async () => {
         return;
       }
       
-      // Use dynamic callback URL based on current hostname
-      const callbackUrl = encodeURIComponent(window.location.origin + '/payment-success?reference=' + ref);
-      const checkoutUrl = `https://checkout.paystack.co/${ref}?amount=${amount}&email=${encodeURIComponent(email)}&callback_url=${callbackUrl}`;
-      
-      window.location.href = checkoutUrl;
+      // 3. Redirect user to the actual Paystack checkout page
+      window.location.href = payData.data.authorization_url;
     } catch (e) {
-      alert("Payment error. Try Pay Later.");
+      console.error(e);
+      alert("Payment error. Ensure PAYSTACK_SECRET_KEY is set in Edge Function secrets.");
     }
   };
 

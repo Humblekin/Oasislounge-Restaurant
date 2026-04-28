@@ -42,14 +42,26 @@ export default function AuthPage({ session }) {
           .single();
         navigate(profileData?.role === 'admin' ? '/admin' : '/menu');
       } else {
-        const { error } = await supabase.auth.signUp({
+        const { data, error } = await supabase.auth.signUp({
           email,
           password,
           options: { data: { full_name: fullName } },
         });
         if (error) throw error;
-        setErrorMsg("Sign up successful! You can now log in.");
-        setIsLogin(true);
+        
+        // Check if email confirmation is required
+        if (data?.user?.identities?.length === 0) {
+          // User already exists
+          setErrorMsg("An account with this email already exists. Please sign in.");
+          setIsLogin(true);
+        } else if (data?.session) {
+          // Email confirmation is disabled — user is auto-logged in
+          navigate('/menu');
+        } else {
+          // Email confirmation is enabled — tell user to check email
+          setErrorMsg("Sign up successful! Please check your email to confirm your account before logging in.");
+          setIsLogin(true);
+        }
       }
     } catch (error) {
       setErrorMsg(error.message);
